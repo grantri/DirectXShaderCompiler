@@ -537,6 +537,9 @@ void SPIRVEmitter::HandleTranslationUnit(ASTContext &context) {
   if (context.getDiagnostics().hasErrorOccurred())
     return;
 
+  theBuilder.setShaderModelVersion(shaderModel.GetMajor(),
+                                   shaderModel.GetMinor());
+
   TranslationUnitDecl *tu = context.getTranslationUnitDecl();
 
   // The entry function is the seed of the queue.
@@ -822,10 +825,61 @@ SpirvEvalInfo SPIRVEmitter::loadIfGLValue(const Expr *expr,
   if (const auto *declContext = isConstantTextureBufferDeclRef(expr)) {
     valType = declIdMapper.getCTBufferPushConstantTypeId(declContext);
   } else {
-    valType = typeTranslator.translateType(
-        expr->getType(), info.getLayoutRule(), info.isRowMajor());
+    valType =
+        typeTranslator.translateType(expr->getType(), info.getLayoutRule());
   }
-  return info.setResultId(theBuilder.createLoad(valType, info)).setRValue();
+
+  uint32_t loadedId = theBuilder.createLoad(valType, info);
+
+  // Special-case: According to the SPIR-V Spec: There is no physical size or
+  // bit pattern defined for boolean type. Therefore an unsigned integer is used
+  // to represent booleans when layout is required. In such cases, after loading
+  // the uint, we should perform a comparison.
+  {
+    uint32_t vecSize = 1, numRows = 0, numCols = 0;
+    if (info.getLayoutRule() != LayoutRule::Void &&
+        isBoolOrVecMatOfBoolType(expr->getType())) {
+      const auto exprType = expr->getType();
+      QualType uintType = astContext.UnsignedIntTy;
+      QualType boolType = astContext.BoolTy;
+      if (TypeTranslator::isScalarType(exprType) ||
+          TypeTranslator::isVectorType(exprType, nullptr, &vecSize)) {
+        const auto fromType =
+            vecSize == 1 ? uintType
+                         : astContext.getExtVectorType(uintType, vecSize);
+        const auto toType =
+            vecSize == 1 ? boolType
+                         : astContext.getExtVectorType(boolType, vecSize);
+        loadedId = castToBool(loadedId, fromType, toType);
+      } else {
+        const bool isMat =
+            TypeTranslator::isMxNMatrix(exprType, nullptr, &numRows, &numCols);
+        assert(isMat);
+        const auto uintRowQualType =
+            astContext.getExtVectorType(uintType, numCols);
+        const auto uintRowQualTypeId =
+            typeTranslator.translateType(uintRowQualType);
+        const auto boolRowQualType =
+            astContext.getExtVectorType(boolType, numCols);
+        const auto boolRowQualTypeId =
+            typeTranslator.translateType(boolRowQualType);
+        const uint32_t resultTypeId =
+            theBuilder.getMatType(boolType, boolRowQualTypeId, numRows);
+        llvm::SmallVector<uint32_t, 4> rows;
+        for (uint32_t i = 0; i < numRows; ++i) {
+          const auto row = theBuilder.createCompositeExtract(uintRowQualTypeId,
+                                                             loadedId, {i});
+          rows.push_back(castToBool(row, uintRowQualType, boolRowQualType));
+        }
+        loadedId = theBuilder.createCompositeConstruct(resultTypeId, rows);
+      }
+      // Now that it is converted to Bool, it has no layout rule.
+      // This result-id should be evaluated as bool from here on out.
+      info.setLayoutRule(LayoutRule::Void);
+    }
+  }
+
+  return info.setResultId(loadedId).setRValue();
 }
 
 SpirvEvalInfo SPIRVEmitter::loadIfAliasVarRef(const Expr *expr) {
@@ -1162,7 +1216,7 @@ void SPIRVEmitter::doVarDecl(const VarDecl *decl) {
     return;
   }
 
-  uint32_t varId = 0;
+  SpirvEvalInfo varId(0);
 
   // The contents in externally visible variables can be updated via the
   // pipeline. They should be handled differently from file and function scope
@@ -2548,7 +2602,7 @@ uint32_t SPIRVEmitter::processByteAddressBufferStructuredBufferGetDimensions(
     // size of the struct) must also be written to the second argument.
     uint32_t size = 0, stride = 0;
     std::tie(std::ignore, size) = typeTranslator.getAlignmentAndSize(
-        type, LayoutRule::GLSLStd430, /*isRowMajor*/ false, &stride);
+        type, LayoutRule::GLSLStd430, &stride);
     const auto sizeId = theBuilder.getConstantUint32(size);
     theBuilder.createStore(doExpr(expr->getArg(1)), sizeId);
   }
@@ -4178,9 +4232,11 @@ SpirvEvalInfo
 SPIRVEmitter::doExtMatrixElementExpr(const ExtMatrixElementExpr *expr) {
   const Expr *baseExpr = expr->getBase();
   const auto baseInfo = doExpr(baseExpr);
+  const auto layoutRule = baseInfo.getLayoutRule();
+  const auto elemType = hlsl::GetHLSLMatElementType(baseExpr->getType());
   const auto accessor = expr->getEncodedElementAccess();
-  const uint32_t elemType = typeTranslator.translateType(
-      hlsl::GetHLSLMatElementType(baseExpr->getType()));
+  const uint32_t elemTypeId =
+      typeTranslator.translateType(elemType, layoutRule);
 
   uint32_t rowCount = 0, colCount = 0;
   hlsl::GetHLSLMatRowColCount(baseExpr->getType(), rowCount, colCount);
@@ -4208,7 +4264,7 @@ SPIRVEmitter::doExtMatrixElementExpr(const ExtMatrixElementExpr *expr) {
         indices[i] = theBuilder.getConstantInt32(indices[i]);
 
       const uint32_t ptrType =
-          theBuilder.getPointerType(elemType, baseInfo.getStorageClass());
+          theBuilder.getPointerType(elemTypeId, baseInfo.getStorageClass());
       if (!indices.empty()) {
         assert(!baseInfo.isRValue());
         // Load the element via access chain
@@ -4218,19 +4274,32 @@ SPIRVEmitter::doExtMatrixElementExpr(const ExtMatrixElementExpr *expr) {
         // be the source pointer.
         elem = baseInfo;
       }
-      elem = theBuilder.createLoad(elemType, elem);
+      elem = theBuilder.createLoad(elemTypeId, elem);
     } else { // e.g., (mat1 + mat2)._m11
-      elem = theBuilder.createCompositeExtract(elemType, baseInfo, indices);
+      elem = theBuilder.createCompositeExtract(elemTypeId, baseInfo, indices);
     }
     elements.push_back(elem);
   }
 
+  const auto size = elements.size();
   auto valueId = elements.front();
-  if (elements.size() > 1) {
-    const uint32_t vecType = theBuilder.getVecType(elemType, elements.size());
+  if (size > 1) {
+    const uint32_t vecType = theBuilder.getVecType(elemTypeId, size);
     valueId = theBuilder.createCompositeConstruct(vecType, elements);
   }
 
+  // Note: Special-case: Booleans have no physical layout, and therefore when
+  // layout is required booleans are represented as unsigned integers.
+  // Therefore, after loading the uint we should convert it boolean.
+  if (elemType->isBooleanType() && layoutRule != LayoutRule::Void) {
+    const auto fromType =
+        size == 1 ? astContext.UnsignedIntTy
+                  : astContext.getExtVectorType(astContext.UnsignedIntTy, size);
+    const auto toType =
+        size == 1 ? astContext.BoolTy
+                  : astContext.getExtVectorType(astContext.BoolTy, size);
+    valueId = castToBool(valueId, fromType, toType);
+  }
   return SpirvEvalInfo(valueId).setRValue();
 }
 
@@ -4243,8 +4312,6 @@ SPIRVEmitter::doHLSLVectorElementExpr(const HLSLVectorElementExpr *expr) {
   const QualType baseType = baseExpr->getType();
   assert(hlsl::IsHLSLVecType(baseType));
   const auto baseSize = hlsl::GetHLSLVecSize(baseType);
-
-  const uint32_t type = typeTranslator.translateType(expr->getType());
   const auto accessorSize = static_cast<size_t>(accessor.Count);
 
   // Depending on the number of elements selected, we emit different
@@ -4270,18 +4337,28 @@ SPIRVEmitter::doHLSLVectorElementExpr(const HLSLVectorElementExpr *expr) {
     // we should use composite extraction. We should check the immediate base
     // instead of the original base here since we can have something like
     // v.xyyz to turn a lvalue v into rvalue.
+    const auto type =
+        typeTranslator.translateType(expr->getType(), baseInfo.getLayoutRule());
     if (!baseInfo.isRValue()) { // E.g., v.x;
       const uint32_t ptrType =
           theBuilder.getPointerType(type, baseInfo.getStorageClass());
       const uint32_t index = theBuilder.getConstantInt32(accessor.Swz0);
       // We need a lvalue here. Do not try to load.
-      return theBuilder.createAccessChain(ptrType, baseInfo, {index});
+      return baseInfo.setResultId(
+          theBuilder.createAccessChain(ptrType, baseInfo, {index}));
     } else { // E.g., (v + w).x;
       // The original base vector may not be a rvalue. Need to load it if
       // it is lvalue since ImplicitCastExpr (LValueToRValue) will be missing
       // for that case.
-      return baseInfo.setResultId(
-          theBuilder.createCompositeExtract(type, baseInfo, {accessor.Swz0}));
+      auto result =
+          theBuilder.createCompositeExtract(type, baseInfo, {accessor.Swz0});
+      // Special-case: Booleans in SPIR-V do not have a physical layout. Uint is
+      // used to represent them when layout is required.
+      if (expr->getType()->isBooleanType() &&
+          baseInfo.getLayoutRule() != LayoutRule::Void)
+        result =
+            castToBool(result, astContext.UnsignedIntTy, astContext.BoolTy);
+      return baseInfo.setResultId(result);
     }
   }
 
@@ -4289,6 +4366,8 @@ SPIRVEmitter::doHLSLVectorElementExpr(const HLSLVectorElementExpr *expr) {
     // Selecting more than one element from a size-1 vector, for example,
     // <scalar>.xx. Construct the vector.
     auto info = loadIfGLValue(baseExpr);
+    const auto type =
+        typeTranslator.translateType(expr->getType(), info.getLayoutRule());
     llvm::SmallVector<uint32_t, 4> components(accessorSize, info);
     return info
         .setResultId(theBuilder.createCompositeConstruct(type, components))
@@ -4310,6 +4389,8 @@ SPIRVEmitter::doHLSLVectorElementExpr(const HLSLVectorElementExpr *expr) {
     return doExpr(baseExpr);
 
   auto info = loadIfGLValue(baseExpr);
+  const auto type =
+      typeTranslator.translateType(expr->getType(), info.getLayoutRule());
   // Use base for both vectors. But we are only selecting values from the
   // first one.
   return info.setResultId(
@@ -4601,6 +4682,7 @@ void SPIRVEmitter::storeValue(const SpirvEvalInfo &lhsPtr,
   };
 
   QualType matElemType = {};
+  QualType elemType = {};
   uint32_t numRows = 0, numCols = 0;
   const bool lhsIsMat =
       typeTranslator.isMxNMatrix(lhsValType, &matElemType, &numRows, &numCols);
@@ -4609,7 +4691,27 @@ void SPIRVEmitter::storeValue(const SpirvEvalInfo &lhsPtr,
 
   if (typeTranslator.isScalarType(lhsValType) ||
       typeTranslator.isVectorType(lhsValType) || lhsIsFloatMat) {
-    theBuilder.createStore(lhsPtr, rhsVal);
+    uint32_t rhsValId = rhsVal;
+
+    // Special-case: According to the SPIR-V Spec: There is no physical size
+    // or bit pattern defined for boolean type. Therefore an unsigned integer
+    // is used to represent booleans when layout is required. In such cases,
+    // we should cast the boolean to uint before creating OpStore.
+    if (isBoolOrVecOfBoolType(lhsValType) &&
+        lhsPtr.getLayoutRule() != LayoutRule::Void) {
+      uint32_t vecSize = 1;
+      const bool isVec =
+          TypeTranslator::isVectorType(lhsValType, nullptr, &vecSize);
+      const auto toType =
+          isVec ? astContext.getExtVectorType(astContext.UnsignedIntTy, vecSize)
+                : astContext.UnsignedIntTy;
+      const auto fromType =
+          isVec ? astContext.getExtVectorType(astContext.BoolTy, vecSize)
+                : astContext.BoolTy;
+      rhsValId = castToInt(rhsValId, fromType, toType, {});
+    }
+
+    theBuilder.createStore(lhsPtr, rhsValId);
   } else if (TypeTranslator::isOpaqueType(lhsValType)) {
     // Resource types are represented using RecordType in the AST.
     // Handle them before the general RecordType.
@@ -4654,15 +4756,13 @@ void SPIRVEmitter::storeValue(const SpirvEvalInfo &lhsPtr,
   } else if (const auto *recordType = lhsValType->getAs<RecordType>()) {
     uint32_t index = 0;
     for (const auto *field : recordType->getDecl()->fields()) {
-      bool isRowMajor =
-          typeTranslator.isRowMajorMatrix(field->getType(), field);
       const auto subRhsValType = typeTranslator.translateType(
-          field->getType(), rhsVal.getLayoutRule(), isRowMajor);
+          field->getType(), rhsVal.getLayoutRule());
       const auto subRhsVal =
           theBuilder.createCompositeExtract(subRhsValType, rhsVal, {index});
       const auto subLhsPtrType = theBuilder.getPointerType(
-          typeTranslator.translateType(field->getType(), lhsPtr.getLayoutRule(),
-                                       isRowMajor),
+          typeTranslator.translateType(field->getType(),
+                                       lhsPtr.getLayoutRule()),
           lhsPtr.getStorageClass());
       const auto subLhsPtr = theBuilder.createAccessChain(
           subLhsPtrType, lhsPtr, {theBuilder.getConstantUint32(index)});
